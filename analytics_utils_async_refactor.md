@@ -1,24 +1,19 @@
 # Analytics Utils Async Refactor
 
 ## Context
-Analytics logging currently crosses two async layers:
+Analytics logging currently crosses multiple async layers:
 
 1) `CompositeAnalyticsUtil` uses Rx (`Observable.fromIterable`) to fan out log calls.
 2) `MqttAnalyticsHelper` uses coroutines to send MQTT events.
+3) Several delegates add Rx/IO scheduling before calling analytics (e.g., `AnalyticsActivityDelegate`, `AnalyticsApplicationDelegate`).
+4) `AnalyticsManager` provides helper wrappers that introduce additional Rx/IO scheduling.
 
-This doubles scheduling, adds allocation overhead per event, and spreads error handling across layers. It also makes it harder to reason about performance when analytics fire frequently (player, settings, detail, etc.).
+This multiplies scheduling, adds allocation overhead per event, and spreads error handling across layers. It also makes it harder to reason about performance when analytics fire frequently (player, settings, detail, etc.).
 
-## Goal
-- Use **one async boundary** for analytics delivery.
-- Centralize thread management and error handling in a single place.
-- Keep an extensible entry point for future analytics backends.
+Additional call-site async layers exist in analytics delegates and helper utilities, which can introduce extra thread hops on top of the core analytics pipeline.
 
 ## Proposed Architecture
-- Rename `CompositeAnalyticsUtil` -> `AnalyticsUtilImpl`.
-- Remove Rx from the analytics fan-out path.
-- Merge `MqttAnalyticsHelper` logic into `MqttAnalyticsUtil`.
-- Put **coroutine scope + dispatch** inside `AnalyticsUtilImpl`.
-- `MqttAnalyticsUtil` becomes a synchronous backend implementation that builds payloads and sends via MQTT client.
+Analytics calls should flow through `AnalyticsUtilImpl`, which owns coroutine dispatch and fan-out. Backend implementations (like MQTT) are synchronous and do not manage threads.
 
 ```
 AnalyticsUtilImpl (coroutines, single async layer)
@@ -27,19 +22,34 @@ AnalyticsUtilImpl (coroutines, single async layer)
 
 ## Current Flow (Before)
 ```
-AnalyticsActivityDelegate
+AnalyticsActivityDelegate (Rx Single)
   -> CompositeAnalyticsUtil (Rx Observable + Schedulers.single())
     -> MqttAnalyticsUtil
       -> MqttAnalyticsHelper (CoroutineScope, Dispatchers.IO)
         -> IAnalytics.logEvent(...)
+
+AnalyticsManager.analyticsWork (Rx Single)
+  -> CompositeAnalyticsUtil (Rx Observable + Schedulers.single())
+    -> MqttAnalyticsHelper (CoroutineScope)
+```
+
+Some call sites also schedule analytics before calling the util:
+```
+AnalyticsApplicationDelegate (Rx Single)
+  -> CompositeAnalyticsUtil (Rx)
+    -> MqttAnalyticsHelper (CoroutineScope)
 ```
 
 ## Target Flow (After)
 ```
-AnalyticsActivityDelegate
+AnalyticsActivityDelegate (direct call)
   -> AnalyticsUtilImpl (CoroutineScope, Dispatchers.IO)
     -> MqttAnalyticsUtil (sync)
       -> IAnalytics.logEvent(...)
+
+AnalyticsManager.analyticsWork (direct call)
+  -> AnalyticsUtilImpl (CoroutineScope, Dispatchers.IO)
+    -> MqttAnalyticsUtil (sync)
 ```
 
 ## Key Changes
@@ -52,6 +62,10 @@ AnalyticsActivityDelegate
   - Owns MQTT settings retrieval (topic/qos), tracking checks, and actual send.
   - No internal coroutines or Rx.
   - No helper class required.
+- Call-site cleanup (follow-up):
+  - Remove Rx scheduling from analytics delegates where `AnalyticsUtilImpl` already dispatches.
+  - Prefer direct calls to `analyticsUtils.logEvent(...)` without extra wrappers.
+  - Simplify `AnalyticsManager` helpers to avoid redundant thread hops.
 
 - Dagger wiring:
   - Remove `MqttAnalyticsHelper` provider.
@@ -60,23 +74,27 @@ AnalyticsActivityDelegate
 
 ## Example Code Changes
 
-### AnalyticsUtilImpl (new, sync fan-out + coroutine boundary)
+### AnalyticsUtilImpl (current implementation)
 ```kotlin
 class AnalyticsUtilImpl(
     private val backends: List<IAnalyticsUtils>,
-    private val isLoggingEnabled: Boolean
+    private val isLoggingEnabled: Boolean,
+    private val environment: Lazy<IEnvironment>
 ) : IAnalyticsUtils {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val fanOutMutex = Mutex()
 
     override fun logEvent(category: String?, action: String, eventParameter: EventParameter?) {
         if (!isLoggingEnabled) return
         scope.launch {
-            backends.forEach { backend ->
-                try {
-                    backend.logEvent(category, action, eventParameter)
-                } catch (t: Throwable) {
-                    Timber.e(t, "Analytics backend failed: %s", backend.javaClass.simpleName)
+            fanOutMutex.withLock {
+                backends.forEach { backend ->
+                    try {
+                        backend.logEvent(category, action, eventParameter)
+                    } catch (t: Throwable) {
+                        Timber.e(t, "Analytics backend failed: %s", backend.javaClass.simpleName)
+                    }
                 }
             }
         }
@@ -84,18 +102,18 @@ class AnalyticsUtilImpl(
 }
 ```
 
-### MqttAnalyticsUtil (merged helper, sync backend)
+### MqttAnalyticsUtil (current implementation)
 ```kotlin
 class MqttAnalyticsUtil(
     private val analytics: Lazy<IAnalytics>,
     private val mqttSettingsProvider: Lazy<IMqttSettingsProvider>,
-    private val eventTrackingSettingsProvider: Lazy<IEventTrackingSettingsProvider>,
-    private val environment: Lazy<IEnvironment>
+    private val eventTrackingSettingsProvider: Lazy<IEventTrackingSettingsProvider>
 ) : IAnalyticsUtils {
 
     override fun logEvent(category: String?, action: String, eventParameter: EventParameter?) {
-        if (!eventTrackingSettingsProvider.get().eventTrackingSettings.isEventTrackingEnabled) return
-        val settings = mqttSettingsProvider.get().mqttSettings ?: return
+        val settings = eventTrackingSettingsProvider.get().eventTrackingSettings ?: return
+        if (!settings.isEventTrackingEnabled) return
+        if (mqttSettingsProvider.get().mqttSettings == null) return
 
         val params = HashMap<String, Any?>().apply {
             put("event_action", action)
@@ -103,8 +121,8 @@ class MqttAnalyticsUtil(
             eventParameter?.parameters?.forEach { (k, v) -> put(k, v) }
         }
 
-        val topic = eventTrackingSettingsProvider.get().eventTrackingSettings.eventTrackingTopicName() ?: "OAAnalytics"
-        val qos = eventTrackingSettingsProvider.get().eventTrackingSettings.eventTrackingQos()
+        val topic = settings.eventTrackingTopicName() ?: "OAAnalytics"
+        val qos = settings.eventTrackingQos()
         val publishOptions = PublishOptions(topic, qos)
 
         analytics.get().logEvent(params, publishOptions, null)
@@ -112,21 +130,32 @@ class MqttAnalyticsUtil(
 }
 ```
 
-## Benefits
-- Removes Rx allocations and scheduler hops per event.
-- Single async boundary, simpler error handling.
-- Easier to add future backends without duplicating thread management.
+### AnalyticsActivityDelegate (current direction)
+```kotlin
+// Before: Single.fromCallable(...).subscribeOn(...)
+fun onScreenViewed() {
+    val attributes = analyticsCommonDelegate.get().getCommonAttributes().apply {
+        put(OneTvEvents.Fields.ATTR_STRING, CATEGORY_NETWORK_ACTIVITY)
+    }
+    analyticsUtils.get().logEvent(
+        CATEGORY_NETWORK_ACTIVITY,
+        VIEWED_SCREEN,
+        EventParameter.create(attributes)
+    )
+}
+```
+
+### AnalyticsManager (current direction)
+```kotlin
+// Before: analyticsWork uses Rx, analyticsWorkCoroutine launches Dispatchers.IO
+fun analyticsWork(work: () -> Unit) {
+    work.invoke()
+}
+```
 
 ## Risks / Considerations
 - Ensure coroutine scope lifecycle is acceptable (app-level singleton).
 - Validate behavior of filter expressions (UTIL flags) remains unchanged.
 - Preserve MQTT topic/qos and debug logging behavior.
-
-## Test / Validation Plan
-- Trigger analytics on key screens (Home, Player, Settings, Detail) and confirm MQTT events are emitted.
-- Verify analytics disable flag still short-circuits logging.
-- Check logcat for new backend error logs (no crash).
-
-## Rollout Notes
-- This is an internal refactor; event payloads should remain unchanged.
-- If future backends are added, they should be synchronous and rely on `AnalyticsUtilImpl` for threading.
+- Some delegates still schedule analytics work; refactoring them is a follow-up to reach a single async hop end-to-end.
+- Mutex location matters: placing serialization in `AnalyticsUtilImpl` assumes all analytics calls route through it. If any backend is called directly, it bypasses the mutex and can run concurrently.
