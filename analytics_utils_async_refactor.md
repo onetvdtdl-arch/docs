@@ -5,12 +5,12 @@ Analytics logging currently crosses multiple async layers:
 
 1) `CompositeAnalyticsUtil` uses Rx (`Observable.fromIterable`) to fan out log calls.
 2) `MqttAnalyticsHelper` uses coroutines to send MQTT events.
-3) Several delegates add Rx/IO scheduling before calling analytics (e.g., `AnalyticsActivityDelegate`, `AnalyticsApplicationDelegate`).
-4) `AnalyticsManager` provides helper wrappers that introduce additional Rx/IO scheduling.
+3) Several delegates used to add Rx/IO scheduling before calling analytics (e.g., `AnalyticsActivityDelegate`, `AnalyticsApplicationDelegate`).
+4) `AnalyticsManager` used to provide helper wrappers that introduced additional Rx/IO scheduling.
 
 This multiplies scheduling, adds allocation overhead per event, and spreads error handling across layers. It also makes it harder to reason about performance when analytics fire frequently (player, settings, detail, etc.).
 
-Additional call-site async layers exist in analytics delegates and helper utilities, which can introduce extra thread hops on top of the core analytics pipeline.
+Additional call-site async layers existed in analytics delegates and helper utilities, which introduced extra thread hops on top of the core analytics pipeline.
 
 ## Proposed Architecture
 Analytics calls should flow through `AnalyticsUtilImpl`, which owns coroutine dispatch and fan-out. Backend implementations (like MQTT) are synchronous and do not manage threads.
@@ -47,10 +47,15 @@ AnalyticsActivityDelegate (direct call)
     -> MqttAnalyticsUtil (sync)
       -> IAnalytics.logEvent(...)
 
-AnalyticsManager.analyticsWork (direct call)
+AnalyticsManager.analyticsWorkCoroutine (direct call)
   -> AnalyticsUtilImpl (CoroutineScope, Dispatchers.IO)
     -> MqttAnalyticsUtil (sync)
 ```
+
+## Current State Snapshot
+- Delegates (`AnalyticsActivityDelegate`, `AnalyticsApplicationDelegate`) log synchronously and rely on `AnalyticsUtilImpl` for async dispatch.
+- Call sites that were previously using `compositeDisposable.add(...)` now call analytics delegates directly.
+- `AnalyticsManager` is reduced to a single synchronous helper: `analyticsWorkCoroutine(work: () -> Unit)`; other helper variants were removed.
 
 ## Key Changes
 - `AnalyticsUtilImpl`:
@@ -62,10 +67,10 @@ AnalyticsManager.analyticsWork (direct call)
   - Owns MQTT settings retrieval (topic/qos), tracking checks, and actual send.
   - No internal coroutines or Rx.
   - No helper class required.
-- Call-site cleanup (follow-up):
-  - Remove Rx scheduling from analytics delegates where `AnalyticsUtilImpl` already dispatches.
-  - Prefer direct calls to `analyticsUtils.logEvent(...)` without extra wrappers.
-  - Simplify `AnalyticsManager` helpers to avoid redundant thread hops.
+- Call-site cleanup:
+  - Removed Rx scheduling from analytics delegates where `AnalyticsUtilImpl` already dispatches.
+  - Switched to direct calls to `analyticsUtils.logEvent(...)` without extra wrappers.
+  - Simplified `AnalyticsManager` helpers to avoid redundant thread hops.
 
 - Dagger wiring:
   - Remove `MqttAnalyticsHelper` provider.
@@ -147,15 +152,33 @@ fun onScreenViewed() {
 
 ### AnalyticsManager (current direction)
 ```kotlin
-// Before: analyticsWork uses Rx, analyticsWorkCoroutine launches Dispatchers.IO
-fun analyticsWork(work: () -> Unit) {
-    work.invoke()
+// Before: analyticsWorkCoroutine launched Dispatchers.IO
+fun analyticsWorkCoroutine(work: () -> Unit) {
+    work()
 }
+```
+
+### Call Site Examples (Before/After)
+```kotlin
+// Before: disposable chaining
+compositeDisposable.add(analyticsAppDelegate.get().appForeground())
+
+// After: direct call
+analyticsAppDelegate.get().appForeground()
+```
+
+```kotlin
+// Before: helper adds async hop
+analyticsWorkScopedCoroutine(lifecycleScope) { analyticsPlayerDelegate.get().onScreenViewed(...) }
+
+// After: direct call (or keep helper, now sync)
+analyticsPlayerDelegate.get().onScreenViewed(...)
 ```
 
 ## Risks / Considerations
 - Ensure coroutine scope lifecycle is acceptable (app-level singleton).
 - Validate behavior of filter expressions (UTIL flags) remains unchanged.
 - Preserve MQTT topic/qos and debug logging behavior.
-- Some delegates still schedule analytics work; refactoring them is a follow-up to reach a single async hop end-to-end.
+- Delegate-level try/catch is defensive; if you want analytics failures to surface, remove those wrappers.
+- Delegates now log directly and rely on `AnalyticsUtilImpl` for async dispatch; remaining wrappers should stay synchronous to avoid double hops.
 - Mutex location matters: placing serialization in `AnalyticsUtilImpl` assumes all analytics calls route through it. If any backend is called directly, it bypasses the mutex and can run concurrently.
