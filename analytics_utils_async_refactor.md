@@ -218,24 +218,65 @@ Refactors landed across modules to strip Rx scheduling wrappers:
 - notification - Notification module (updated AnalyticsNotificationDelegate)
 - digitalnpsdomain - Digital NPS domain module (updated NpsAnalyticsDelegate)
 
-### Call Site Examples (Before/After)
+### Example (loginui/AnalyticsAccountManagementDelegate)
 ```kotlin
-// Before: disposable chaining
-compositeDisposable.add(analyticsAppDelegate.get().appForeground())
+// Before: Rx wrapper
+fun onLoginInitiated(loginType: LoginEvent.LoginType): Disposable =
+    Single
+        .fromCallable {
+            val attributes = commonDelegate.get().getCommonAttributes()
+            Timber.tag(TAG).d("onLoginInitiated login type = ${loginType.value}")
+            attributes.apply {
+                put(com.atvretail.analytics.OneTvEvents.Fields.ATTR_STRING, ACCOUNT_MANAGEMENT)
+                put(LOGIN_TYPE, loginType.value)
+            }
+            attributes
+        }
+        .subscribeOn(Schedulers.io())
+        .subscribe({
+            analyticsUtils.get().logEvent(
+                ACCOUNT_MANAGEMENT,
+                ACCOUNT_MANAGEMENT_LOGIN_INITIATED,
+                EventParameter.create(it)
+            )
+        }, {
+            Timber.tag(TAG).d("onLoginInitiated error")
+            Timber.e(it, "onLoginInitiated error")
+        })
 
 // After: direct call
-analyticsAppDelegate.get().appForeground()
-```
+fun onLoginInitiated(loginType: LoginEvent.LoginType) {
+    try {
+        val attributes = commonDelegate.get().getCommonAttributes()
+        Timber.tag(TAG).d("onLoginInitiated login type = ${loginType.value}")
+        attributes.apply {
+            put(com.atvretail.analytics.OneTvEvents.Fields.ATTR_STRING, ACCOUNT_MANAGEMENT)
+            put(LOGIN_TYPE, loginType.value)
+        }
 
-```kotlin
-// Before: helper adds async hop
-analyticsWorkScopedCoroutine(lifecycleScope) { analyticsPlayerDelegate.get().onScreenViewed(...) }
-
-// After: direct call (or keep helper, now sync)
-analyticsPlayerDelegate.get().onScreenViewed(...)
+        analyticsUtils.get().logEvent(
+            ACCOUNT_MANAGEMENT,
+            ACCOUNT_MANAGEMENT_LOGIN_INITIATED,
+            EventParameter.create(attributes)
+        )
+    } catch (throwable: Throwable) {
+        Timber.tag(TAG).d("onLoginInitiated error")
+        Timber.e(throwable, "onLoginInitiated error")
+    }
+}
 ```
 
 ### Phase 5: Centralize common attribute fetching
+Common attributes now come from `AnalyticsUtilImpl`, which always merges `AnalyticsCommonDelegate.getAttributes()` before dispatching. Delegates no longer build or enrich common attributes per call.
+
+### AnalyticsUtilImpl (common attribute merge)
+```kotlin
+val param = EventParameter.create(
+    analyticsCommonDelegate.get().getAttributes().apply {
+        putAll(eventParameter?.parameters ?: emptyMap())
+    }
+)
+```
 
 ### AnalyticsCommonDelegate (current implementation)
 ```kotlin
@@ -267,6 +308,13 @@ fun getAttributes(): HashMap<String, Any?> {
             }
         }
     }
+}
+```
+
+### AnalyticsCommonDelegate (no-op placeholder)
+```kotlin
+fun getCommonAttributes(): HashMap<String, Any?> {
+    return hashMapOf()
 }
 ```
 
