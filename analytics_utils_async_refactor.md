@@ -56,12 +56,15 @@ AnalyticsManager.analyticsWorkCoroutine (direct call)
 - Delegates (`AnalyticsActivityDelegate`, `AnalyticsApplicationDelegate`) log synchronously and rely on `AnalyticsUtilImpl` for async dispatch.
 - Call sites that were previously using `compositeDisposable.add(...)` now call analytics delegates directly.
 - `AnalyticsManager` is reduced to a single synchronous helper: `analyticsWorkCoroutine(work: () -> Unit)`; other helper variants were removed.
+- `AnalyticsUtilImpl` now builds common attributes via `AnalyticsCommonDelegate.getAttributes()` and merges event-specific parameters in one place.
+- `AnalyticsCommonDelegate.getCommonAttributes()` is now a no-op placeholder; call sites should avoid building common attributes locally.
 
 ## Key Changes
 - `AnalyticsUtilImpl`:
   - Holds a list of `IAnalyticsUtils` backends.
   - Uses a single coroutine scope to dispatch all log calls off the caller thread.
   - Wraps each backend call in try/catch to avoid failure fan-out.
+  - Centralizes common attribute assembly using `AnalyticsCommonDelegate.getAttributes()`.
 
 - `MqttAnalyticsUtil`:
   - Owns MQTT settings retrieval (topic/qos), tracking checks, and actual send.
@@ -71,37 +74,75 @@ AnalyticsManager.analyticsWorkCoroutine (direct call)
   - Removed Rx scheduling from analytics delegates where `AnalyticsUtilImpl` already dispatches.
   - Switched to direct calls to `analyticsUtils.logEvent(...)` without extra wrappers.
   - Simplified `AnalyticsManager` helpers to avoid redundant thread hops.
+  - Removed per-call common attribute fetching in delegates; `AnalyticsUtilImpl` now handles it.
 
 - Dagger wiring:
   - Remove `MqttAnalyticsHelper` provider.
   - Provide `MqttAnalyticsUtil` directly.
   - Provide `AnalyticsUtilImpl` as `IAnalyticsUtils`.
 
-## Example Code Changes
+## Example Code Changes (Phased)
+
+### Phase 1: Rename/merge utils + move coroutine fan-out
+Renamed `CompositeAnalyticsUtil` to `AnalyticsUtilImpl`, merged `MqttAnalyticsHelper` into `MqttAnalyticsUtil`, and moved coroutine + mutex fan-out into `AnalyticsUtilImpl`.
 
 ### AnalyticsUtilImpl (current implementation)
 ```kotlin
 class AnalyticsUtilImpl(
-    private val backends: List<IAnalyticsUtils>,
-    private val isLoggingEnabled: Boolean,
+    private val analyticsUtils: List<IAnalyticsUtils>,
+    private val isLoggingEnabled: Boolean = false,
+    private val analyticsCommonDelegate: Lazy<AnalyticsCommonDelegate>,
     private val environment: Lazy<IEnvironment>
 ) : IAnalyticsUtils {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val fanOutMutex = Mutex()
+    private val scopeName = "Analytics-Scope"
+    private val mqttExceptionHandler =
+        CoroutineExceptionHandler { _, throwable ->
+            Timber.e(throwable, "Exception in AnalyticsUtilImpl: ${throwable.message}")
+        }
+    private val mutex = Mutex()
+    private val scope: CoroutineScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineName(scopeName) + mqttExceptionHandler)
 
-    override fun logEvent(category: String?, action: String, eventParameter: EventParameter?) {
+    private inline fun dispatch(crossinline call: (IAnalyticsUtils) -> Unit) {
         if (!isLoggingEnabled) return
         scope.launch {
-            fanOutMutex.withLock {
-                backends.forEach { backend ->
+            mutex.withLock {
+                analyticsUtils.forEach { backend ->
                     try {
-                        backend.logEvent(category, action, eventParameter)
-                    } catch (t: Throwable) {
-                        Timber.e(t, "Analytics backend failed: %s", backend.javaClass.simpleName)
+                        call(backend)
+                    } catch (throwable: Throwable) {
+                        Timber.e(
+                            throwable,
+                            "Analytics backend failed: %s",
+                            backend.javaClass.simpleName
+                        )
                     }
                 }
             }
+        }
+    }
+
+    override fun logEvent(
+        category: String?,
+        action: String,
+        eventParameter: EventParameter?
+    ) {
+        dispatch {
+            val param = EventParameter.create(
+                analyticsCommonDelegate.get().getAttributes().apply {
+                    putAll(eventParameter?.parameters ?: emptyMap())
+                }
+            )
+            logDebug(
+                "Mqtt - streaming event :: logging - category=%s, action=%s, eventParameters=%s",
+                category,
+                action,
+                param
+            )
+            it.logEvent(
+                category, action, param
+            )
         }
     }
 }
@@ -135,11 +176,13 @@ class MqttAnalyticsUtil(
 }
 ```
 
+### Phase 2: Remove Rx from delegates
+
 ### AnalyticsActivityDelegate (current direction)
 ```kotlin
 // Before: Single.fromCallable(...).subscribeOn(...)
 fun onScreenViewed() {
-    val attributes = analyticsCommonDelegate.get().getCommonAttributes().apply {
+    val attributes = hashMapOf<String, Any?>().apply {
         put(OneTvEvents.Fields.ATTR_STRING, CATEGORY_NETWORK_ACTIVITY)
     }
     analyticsUtils.get().logEvent(
@@ -150,6 +193,8 @@ fun onScreenViewed() {
 }
 ```
 
+### Phase 3: Collapse AnalyticsManager async variants
+
 ### AnalyticsManager (current direction)
 ```kotlin
 // Before: analyticsWorkCoroutine launched Dispatchers.IO
@@ -157,6 +202,21 @@ fun analyticsWorkCoroutine(work: () -> Unit) {
     work()
 }
 ```
+
+### Phase 4: Remove Rx from other delegates and modules
+
+Refactors landed across modules to strip Rx scheduling wrappers:
+- analytics - Core analytics module (refactored AnalyticsCommonDelegate, removed RxJava dependencies)
+- playerui - Player UI module (updated AnalyticsPlayerDelegate)
+- channelui - Channel UI module (updated AnalyticsChannelsDelegate)
+- detailui - Detail UI module (updated AnalyticsDetailDelegate)
+- epgui - EPG UI module (updated AnalyticsEpgDelegate)
+- loginui - Login UI module (updated AnalyticsAccountManagementDelegate)
+- homeui - Home UI module (updated SettingsAnalyticsDelegate)
+- settingsui - Settings UI module (updated AnalyticsPinAuthenticationDelegate)
+- tvsubpageui - TV Subpage UI module (updated SubpageAnalyticsDelegate)
+- notification - Notification module (updated AnalyticsNotificationDelegate)
+- digitalnpsdomain - Digital NPS domain module (updated NpsAnalyticsDelegate)
 
 ### Call Site Examples (Before/After)
 ```kotlin
@@ -173,6 +233,41 @@ analyticsWorkScopedCoroutine(lifecycleScope) { analyticsPlayerDelegate.get().onS
 
 // After: direct call (or keep helper, now sync)
 analyticsPlayerDelegate.get().onScreenViewed(...)
+```
+
+### Phase 5: Centralize common attribute fetching
+
+### AnalyticsCommonDelegate (current implementation)
+```kotlin
+fun getAttributes(): HashMap<String, Any?> {
+    return hashMapOf<String, Any?>().apply {
+        putAll(staticCommonAttributes)
+        put(KEYS.COMMON_CONNECTION_TYPE, analyticsConstants.getConnectionType())
+        put(KEYS.COMMON_USER_ID, analyticsConstants.userId())
+        put(KEYS.COMMON_SESSION_ID, environment.get().userSessionId)
+        put(KEYS.COMMON_NETWORK_PROVIDER, connectivityUtil.get().networkTypeInfo)
+        put(KEYS.COMMON_TIMESTAMP, DateTimeUtils.currentTimeMillis())
+        put(KEYS.COMMON_IP_ADDRESS, PublicIpAddressHolder.getPublicIpAddress())
+        put(KEYS.COMMON_LOG_TIME, DateTimeManager.getCurrentDateTimeInUtc(true).toString())
+        put(KEYS.PERSONA_ID, authPreferences.personaId)
+        put(KEYS.PERSONALISED_CONTENT_OPT_OUT, analyticsConstants.isOptedOut())
+        put(KEYS.COMMON_ACCOUNT_ID, analyticsConstants.accountId())
+        put(KEYS.COMMON_ACCOUNT_TYPE, analyticsConstants.accountType())
+        if (environment.get().isManagedDevice) {
+            if (DeviceUtils.cpuUsage != null && cmsDataManager.cmsConfig.isCPULoggingEnabled) {
+                put(KEYS.COMMON_CPU_USAGE, DeviceUtils.cpuUsage)
+            }
+            if (cmsDataManager.cmsConfig.isMemoryLoggingEnabled) {
+                if (DeviceUtils.availableMemoryInMB != null) {
+                    put(KEYS.COMMON_AVAILABLE_MEMORY, DeviceUtils.availableMemoryInMB)
+                }
+                if (DeviceUtils.totalMemoryInMB != null) {
+                    put(KEYS.COMMON_TOTAL_MEMORY, DeviceUtils.totalMemoryInMB)
+                }
+            }
+        }
+    }
+}
 ```
 
 ## Risks / Considerations
